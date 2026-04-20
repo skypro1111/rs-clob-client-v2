@@ -405,8 +405,8 @@ struct ClientInner<S: State> {
     tick_sizes: DashMap<U256, TickSize>,
     /// Local cache representing whether this token is part of a `neg_risk` market
     neg_risk: DashMap<U256, bool>,
-    /// Local cache representing the fee rate in basis points per token ID
-    fee_rate_bps: DashMap<U256, u32>,
+    /// Local cache of the fee rate (`base_fee` + exponent) per token ID
+    fee_rate_bps: DashMap<U256, FeeRateResponse>,
     /// Local cache of builder fee rates per builder code
     builder_fee_rates: DashMap<B256, BuilderFeeRateResponse>,
     /// The funder for this [`ClientInner`]. If funder is present, then `signature_type` cannot
@@ -581,7 +581,18 @@ impl<S: State> Client<S> {
     /// # }
     /// ```
     pub fn set_fee_rate_bps(&self, token_id: U256, fee_rate_bps: u32) {
-        self.inner.fee_rate_bps.insert(token_id, fee_rate_bps);
+        self.inner.fee_rate_bps.insert(
+            token_id,
+            FeeRateResponse {
+                base_fee: fee_rate_bps,
+                exponent: None,
+            },
+        );
+    }
+
+    /// Pre-populates the fee rate cache for a token with both base fee and exponent.
+    pub fn set_fee_rate(&self, token_id: U256, fee_rate: FeeRateResponse) {
+        self.inner.fee_rate_bps.insert(token_id, fee_rate);
     }
 
     /// Checks if the CLOB API is healthy and operational.
@@ -858,13 +869,10 @@ impl<S: State> Client<S> {
     ///
     /// Returns an error if the request fails or the token ID is invalid.
     pub async fn fee_rate_bps(&self, token_id: U256) -> Result<FeeRateResponse> {
-        if let Some(base_fee) = self.inner.fee_rate_bps.get(&token_id) {
+        if let Some(cached) = self.inner.fee_rate_bps.get(&token_id) {
             #[cfg(feature = "tracing")]
-            tracing::trace!(token_id = %token_id, base_fee = *base_fee, "cache hit: fee_rate_bps");
-            return Ok(FeeRateResponse {
-                base_fee: *base_fee,
-                exponent: None,
-            });
+            tracing::trace!(token_id = %token_id, base_fee = cached.base_fee, "cache hit: fee_rate_bps");
+            return Ok(cached.clone());
         }
 
         #[cfg(feature = "tracing")]
@@ -878,7 +886,7 @@ impl<S: State> Client<S> {
 
         let response = crate::request::<FeeRateResponse>(&self.inner.client, request, None).await?;
 
-        self.inner.fee_rate_bps.insert(token_id, response.base_fee);
+        self.inner.fee_rate_bps.insert(token_id, response.clone());
 
         #[cfg(feature = "tracing")]
         tracing::trace!(token_id = %token_id, "cached fee_rate_bps");
@@ -1195,6 +1203,10 @@ impl<S: State> Client<S> {
         let response: ClobMarketInfoResponse =
             crate::request(&self.inner.client, request, None).await?;
 
+        let fee_rate = FeeRateResponse {
+            base_fee: response.fee_rate_bps,
+            exponent: response.fee_exponent,
+        };
         for token in &response.tokens {
             self.inner
                 .tick_sizes
@@ -1204,7 +1216,7 @@ impl<S: State> Client<S> {
                 .insert(token.token_id, response.neg_risk);
             self.inner
                 .fee_rate_bps
-                .insert(token.token_id, response.fee_rate_bps);
+                .insert(token.token_id, fee_rate.clone());
         }
 
         Ok(response)
@@ -2359,6 +2371,208 @@ impl<K: Kind> Client<Authenticated<K>> {
         auth::l2::create_headers(self.state(), request, timestamp).await
     }
 
+    /// Creates an RFQ Request to buy or sell outcome tokens.
+    ///
+    /// This initiates the RFQ flow where market makers can provide quotes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP request fails or the response cannot be parsed.
+    #[cfg(feature = "rfq")]
+    pub async fn create_request(
+        &self,
+        request: &CreateRfqRequestRequest,
+    ) -> Result<CreateRfqRequestResponse> {
+        let http_request = self
+            .client()
+            .request(Method::POST, format!("{}rfq/request", self.host()))
+            .json(request)
+            .build()?;
+        let headers = self.create_headers(&http_request).await?;
+
+        crate::request(&self.inner.client, http_request, Some(headers)).await
+    }
+
+    /// Cancels an RFQ request.
+    ///
+    /// The request must be in the `STATE_ACCEPTING_QUOTES` state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP request fails or the request cannot be canceled.
+    #[cfg(feature = "rfq")]
+    pub async fn cancel_request(&self, request: &CancelRfqRequestRequest) -> Result<()> {
+        let http_request = self
+            .client()
+            .request(Method::DELETE, format!("{}rfq/request", self.host()))
+            .json(request)
+            .build()?;
+        let headers = self.create_headers(&http_request).await?;
+
+        self.rfq_request_text(http_request, headers).await
+    }
+
+    /// Gets RFQ requests.
+    ///
+    /// Requesters can only view their own requests.
+    /// Quoters can only see their own quotes and requests that they quoted.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP request fails or the response cannot be parsed.
+    #[cfg(feature = "rfq")]
+    pub async fn requests(
+        &self,
+        request: &RfqRequestsRequest,
+        next_cursor: Option<&str>,
+    ) -> Result<Page<RfqRequest>> {
+        let params = request.query_params(next_cursor);
+        let http_request = self
+            .client()
+            .request(
+                Method::GET,
+                format!("{}rfq/data/requests{params}", self.host()),
+            )
+            .build()?;
+        let headers = self.create_headers(&http_request).await?;
+
+        crate::request(&self.inner.client, http_request, Some(headers)).await
+    }
+
+    /// Creates an RFQ Quote in response to a Request.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP request fails or the response cannot be parsed.
+    #[cfg(feature = "rfq")]
+    pub async fn create_quote(
+        &self,
+        request: &CreateRfqQuoteRequest,
+    ) -> Result<CreateRfqQuoteResponse> {
+        let http_request = self
+            .client()
+            .request(Method::POST, format!("{}rfq/quote", self.host()))
+            .json(request)
+            .build()?;
+        let headers = self.create_headers(&http_request).await?;
+
+        crate::request(&self.inner.client, http_request, Some(headers)).await
+    }
+
+    /// Cancels an RFQ quote.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP request fails or the quote cannot be canceled.
+    #[cfg(feature = "rfq")]
+    pub async fn cancel_quote(&self, request: &CancelRfqQuoteRequest) -> Result<()> {
+        let http_request = self
+            .client()
+            .request(Method::DELETE, format!("{}rfq/quote", self.host()))
+            .json(request)
+            .build()?;
+        let headers = self.create_headers(&http_request).await?;
+
+        self.rfq_request_text(http_request, headers).await
+    }
+
+    /// Gets RFQ quotes.
+    ///
+    /// Requesters can view quotes for their requests.
+    /// Quoters can view all quotes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP request fails or the response cannot be parsed.
+    #[cfg(feature = "rfq")]
+    pub async fn quotes(
+        &self,
+        request: &RfqQuotesRequest,
+        next_cursor: Option<&str>,
+    ) -> Result<Page<RfqQuote>> {
+        let params = request.query_params(next_cursor);
+        let http_request = self
+            .client()
+            .request(
+                Method::GET,
+                format!("{}rfq/data/quotes{params}", self.host()),
+            )
+            .build()?;
+        let headers = self.create_headers(&http_request).await?;
+
+        crate::request(&self.inner.client, http_request, Some(headers)).await
+    }
+
+    /// Requester accepts an RFQ Quote.
+    ///
+    /// This creates an Order that the Requester must sign. The signed order
+    /// is submitted to the API to initiate the trade.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP request fails or the quote cannot be accepted.
+    #[cfg(feature = "rfq")]
+    pub async fn accept_quote(
+        &self,
+        request: &AcceptRfqQuoteRequest,
+    ) -> Result<AcceptRfqQuoteResponse> {
+        let http_request = self
+            .client()
+            .request(Method::POST, format!("{}rfq/request/accept", self.host()))
+            .json(request)
+            .build()?;
+        let headers = self.create_headers(&http_request).await?;
+
+        self.rfq_request_text(http_request, headers).await?;
+        Ok(AcceptRfqQuoteResponse)
+    }
+
+    /// Quoter approves an RFQ order during the last look window.
+    ///
+    /// This queues the order for onchain execution.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP request fails or the order cannot be approved.
+    #[cfg(feature = "rfq")]
+    pub async fn approve_order(
+        &self,
+        request: &ApproveRfqOrderRequest,
+    ) -> Result<ApproveRfqOrderResponse> {
+        let http_request = self
+            .client()
+            .request(Method::POST, format!("{}rfq/quote/approve", self.host()))
+            .json(request)
+            .build()?;
+        let headers = self.create_headers(&http_request).await?;
+
+        crate::request(&self.inner.client, http_request, Some(headers)).await
+    }
+
+    /// Helper method for RFQ endpoints that return plain text instead of JSON.
+    ///
+    /// This is used for cancel operations (`cancel_request`, `cancel_quote`)
+    /// and accept quote which return "OK" as plain text rather than a JSON response.
+    /// The standard `crate::request` helper expects JSON responses and would fail
+    /// to deserialize plain text.
+    #[cfg(feature = "rfq")]
+    async fn rfq_request_text(&self, mut request: Request, headers: HeaderMap) -> Result<()> {
+        let method = request.method().clone();
+        let path = request.url().path().to_owned();
+
+        *request.headers_mut() = headers;
+
+        let response = self.inner.client.execute(request).await?;
+        let status = response.status();
+
+        if !status.is_success() {
+            let message = response.text().await.unwrap_or_default();
+            return Err(crate::error::Error::status(status, method, path, message));
+        }
+
+        Ok(())
+    }
+
     fn order_builder<OrderKind>(&self) -> OrderBuilder<OrderKind, K> {
         OrderBuilder {
             signer: self.address(),
@@ -2502,206 +2716,6 @@ impl Client<Authenticated<Builder>> {
         let headers = self.create_headers(&request).await?;
 
         crate::request(&self.inner.client, request, Some(headers)).await
-    }
-}
-
-#[cfg(feature = "rfq")]
-#[expect(
-    clippy::multiple_inherent_impl,
-    reason = "RFQ methods must be in a separate impl block due to the feature gate"
-)]
-impl<K: Kind> Client<Authenticated<K>> {
-    /// Creates an RFQ Request to buy or sell outcome tokens.
-    ///
-    /// This initiates the RFQ flow where market makers can provide quotes.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the HTTP request fails or the response cannot be parsed.
-    pub async fn create_request(
-        &self,
-        request: &CreateRfqRequestRequest,
-    ) -> Result<CreateRfqRequestResponse> {
-        let http_request = self
-            .client()
-            .request(Method::POST, format!("{}rfq/request", self.host()))
-            .json(request)
-            .build()?;
-        let headers = self.create_headers(&http_request).await?;
-
-        crate::request(&self.inner.client, http_request, Some(headers)).await
-    }
-
-    /// Cancels an RFQ request.
-    ///
-    /// The request must be in the `STATE_ACCEPTING_QUOTES` state.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the HTTP request fails or the request cannot be canceled.
-    pub async fn cancel_request(&self, request: &CancelRfqRequestRequest) -> Result<()> {
-        let http_request = self
-            .client()
-            .request(Method::DELETE, format!("{}rfq/request", self.host()))
-            .json(request)
-            .build()?;
-        let headers = self.create_headers(&http_request).await?;
-
-        self.rfq_request_text(http_request, headers).await
-    }
-
-    /// Gets RFQ requests.
-    ///
-    /// Requesters can only view their own requests.
-    /// Quoters can only see their own quotes and requests that they quoted.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the HTTP request fails or the response cannot be parsed.
-    pub async fn requests(
-        &self,
-        request: &RfqRequestsRequest,
-        next_cursor: Option<&str>,
-    ) -> Result<Page<RfqRequest>> {
-        let params = request.query_params(next_cursor);
-        let http_request = self
-            .client()
-            .request(
-                Method::GET,
-                format!("{}rfq/data/requests{params}", self.host()),
-            )
-            .build()?;
-        let headers = self.create_headers(&http_request).await?;
-
-        crate::request(&self.inner.client, http_request, Some(headers)).await
-    }
-
-    /// Creates an RFQ Quote in response to a Request.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the HTTP request fails or the response cannot be parsed.
-    pub async fn create_quote(
-        &self,
-        request: &CreateRfqQuoteRequest,
-    ) -> Result<CreateRfqQuoteResponse> {
-        let http_request = self
-            .client()
-            .request(Method::POST, format!("{}rfq/quote", self.host()))
-            .json(request)
-            .build()?;
-        let headers = self.create_headers(&http_request).await?;
-
-        crate::request(&self.inner.client, http_request, Some(headers)).await
-    }
-
-    /// Cancels an RFQ quote.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the HTTP request fails or the quote cannot be canceled.
-    pub async fn cancel_quote(&self, request: &CancelRfqQuoteRequest) -> Result<()> {
-        let http_request = self
-            .client()
-            .request(Method::DELETE, format!("{}rfq/quote", self.host()))
-            .json(request)
-            .build()?;
-        let headers = self.create_headers(&http_request).await?;
-
-        self.rfq_request_text(http_request, headers).await
-    }
-
-    /// Gets RFQ quotes.
-    ///
-    /// Requesters can view quotes for their requests.
-    /// Quoters can view all quotes.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the HTTP request fails or the response cannot be parsed.
-    pub async fn quotes(
-        &self,
-        request: &RfqQuotesRequest,
-        next_cursor: Option<&str>,
-    ) -> Result<Page<RfqQuote>> {
-        let params = request.query_params(next_cursor);
-        let http_request = self
-            .client()
-            .request(
-                Method::GET,
-                format!("{}rfq/data/quotes{params}", self.host()),
-            )
-            .build()?;
-        let headers = self.create_headers(&http_request).await?;
-
-        crate::request(&self.inner.client, http_request, Some(headers)).await
-    }
-
-    /// Requester accepts an RFQ Quote.
-    ///
-    /// This creates an Order that the Requester must sign. The signed order
-    /// is submitted to the API to initiate the trade.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the HTTP request fails or the quote cannot be accepted.
-    pub async fn accept_quote(
-        &self,
-        request: &AcceptRfqQuoteRequest,
-    ) -> Result<AcceptRfqQuoteResponse> {
-        let http_request = self
-            .client()
-            .request(Method::POST, format!("{}rfq/request/accept", self.host()))
-            .json(request)
-            .build()?;
-        let headers = self.create_headers(&http_request).await?;
-
-        self.rfq_request_text(http_request, headers).await?;
-        Ok(AcceptRfqQuoteResponse)
-    }
-
-    /// Quoter approves an RFQ order during the last look window.
-    ///
-    /// This queues the order for onchain execution.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the HTTP request fails or the order cannot be approved.
-    pub async fn approve_order(
-        &self,
-        request: &ApproveRfqOrderRequest,
-    ) -> Result<ApproveRfqOrderResponse> {
-        let http_request = self
-            .client()
-            .request(Method::POST, format!("{}rfq/quote/approve", self.host()))
-            .json(request)
-            .build()?;
-        let headers = self.create_headers(&http_request).await?;
-
-        crate::request(&self.inner.client, http_request, Some(headers)).await
-    }
-
-    /// Helper method for RFQ endpoints that return plain text instead of JSON.
-    ///
-    /// This is used for cancel operations (`cancel_request`, `cancel_quote`)
-    /// and accept quote which return "OK" as plain text rather than a JSON response.
-    /// The standard `crate::request` helper expects JSON responses and would fail
-    /// to deserialize plain text.
-    async fn rfq_request_text(&self, mut request: Request, headers: HeaderMap) -> Result<()> {
-        let method = request.method().clone();
-        let path = request.url().path().to_owned();
-
-        *request.headers_mut() = headers;
-
-        let response = self.inner.client.execute(request).await?;
-        let status = response.status();
-
-        if !status.is_success() {
-            let message = response.text().await.unwrap_or_default();
-            return Err(crate::error::Error::status(status, method, path, message));
-        }
-
-        Ok(())
     }
 }
 
