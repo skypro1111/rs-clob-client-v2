@@ -379,7 +379,7 @@ impl<K: AuthKind> OrderBuilder<Limit, K> {
         let order = self.build().await?;
         let signed = client.sign(signer, order).await?;
         let result = client.post_order(signed).await;
-        if let Err(ref err) = result {
+        if let Err(err) = &result {
             if let Some(status) = err.downcast_ref::<crate::error::Status>() {
                 if status
                     .message
@@ -634,7 +634,7 @@ impl<K: AuthKind> OrderBuilder<Market, K> {
         let order = self.build().await?;
         let signed = client.sign(signer, order).await?;
         let result = client.post_order(signed).await;
-        if let Err(ref err) = result {
+        if let Err(err) = &result {
             if let Some(status) = err.downcast_ref::<crate::error::Status>() {
                 if status
                     .message

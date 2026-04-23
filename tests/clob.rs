@@ -1879,7 +1879,7 @@ mod authenticated {
                 .header(POLY_ADDRESS, client.address().to_checksum(None))
                 .header(POLY_API_KEY, API_KEY)
                 .header(POLY_PASSPHRASE, PASSPHRASE)
-                .json_body(json!({ "orderId": "1" }));
+                .json_body(json!({ "orderID": "1" }));
             then.status(StatusCode::OK).json_body(json!({
                     "canceled": [],
                     "notCanceled": {
@@ -1915,7 +1915,7 @@ mod authenticated {
                 .header(POLY_ADDRESS, client.address().to_checksum(None))
                 .header(POLY_API_KEY, API_KEY)
                 .header(POLY_PASSPHRASE, PASSPHRASE)
-                .json_body(json!({ "orderId": "1" }));
+                .json_body(json!({ "orderID": "1" }));
             then.status(StatusCode::OK).json_body(json!({
                     "canceled": [],
                     "not_canceled": {
