@@ -11,7 +11,8 @@ use strum_macros::Display;
 
 use crate::Result;
 use crate::auth::ApiKey;
-use crate::clob::order_builder::{LOT_SIZE_SCALE, USDC_DECIMALS};
+use crate::clob::order_builder::LOT_SIZE_SCALE;
+use crate::clob::utilities::USDC_DECIMALS;
 use crate::error::Error;
 use crate::types::Decimal;
 

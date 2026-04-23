@@ -2330,7 +2330,7 @@ impl<K: Kind> Client<Authenticated<K>> {
         let path = request.url().path().to_owned();
         let headers = self.create_headers(&request).await?;
 
-        *request.headers_mut() = headers;
+        request.headers_mut().extend(headers);
         let response = self.inner.client.execute(request).await?;
         let status = response.status();
 

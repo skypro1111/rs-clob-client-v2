@@ -17,10 +17,9 @@ use crate::clob::types::{
     Amount, AmountInner, OrderPayload, OrderType, OrderV1, OrderV2, Side, SignableOrder,
     SignatureType,
 };
+use crate::clob::utilities::USDC_DECIMALS;
 use crate::error::Error;
 use crate::types::{Address, Decimal};
-
-pub(crate) const USDC_DECIMALS: u32 = 6;
 
 /// Maximum number of decimal places for `size`
 pub(crate) const LOT_SIZE_SCALE: u32 = 2;
