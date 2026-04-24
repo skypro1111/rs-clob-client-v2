@@ -89,9 +89,6 @@ pub struct NegRiskResponse {
 #[derive(Clone, Debug, Deserialize, Builder, PartialEq)]
 pub struct FeeRateResponse {
     pub base_fee: u32,
-    /// Fee exponent for the platform fee formula (V2).
-    #[serde(default)]
-    pub exponent: Option<u32>,
 }
 
 /// Response from the Polymarket geoblock endpoint.
@@ -705,6 +702,82 @@ pub struct Page<T> {
     pub limit: u64,
     /// The length of `data`
     pub count: u64,
+}
+
+#[non_exhaustive]
+#[derive(Clone, Debug, Deserialize, Builder, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ReadonlyApiKeyResponse {
+    pub api_key: String,
+}
+
+/// Cached V2 fee parameters keyed by token, sourced from `/clob-markets/{id}`'s `fd` field.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct FeeInfo {
+    pub rate: Decimal,
+    pub exponent: u32,
+}
+
+/// Platform fee parameters for a V2 market. Applied as `rate × (price × (1 − price))^exponent`.
+#[non_exhaustive]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+pub struct FeeDetails {
+    #[serde(rename = "r", default)]
+    pub rate: Decimal,
+    #[serde(rename = "e", default)]
+    pub exponent: u32,
+    #[serde(rename = "to", default)]
+    pub taker_only: bool,
+}
+
+#[non_exhaustive]
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+pub struct ClobToken {
+    #[serde(rename = "t")]
+    pub token_id: U256,
+    #[serde(rename = "o")]
+    pub outcome: String,
+}
+
+/// Response from `GET /clob-markets/{condition_id}`. Uses the server's short wire
+/// keys (`c`, `t`, `mts`, …) renamed to ergonomic Rust names.
+#[non_exhaustive]
+#[serde_as]
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+pub struct ClobMarketInfoResponse {
+    #[serde(rename = "c")]
+    pub condition_id: B256,
+    #[serde(rename = "t", default)]
+    #[serde_as(deserialize_as = "DefaultOnNull")]
+    pub tokens: Vec<Option<ClobToken>>,
+    #[serde(rename = "mts")]
+    #[serde_as(as = "TryFromInto<Decimal>")]
+    pub min_tick_size: TickSize,
+    #[serde(rename = "mos", default)]
+    pub min_order_size: Decimal,
+    #[serde(rename = "nr", default)]
+    pub neg_risk: bool,
+    #[serde(rename = "fd", default)]
+    pub fee_details: Option<FeeDetails>,
+    /// Legacy V1 maker base fee. Unused in V2 settlement.
+    #[serde(rename = "mbf", default)]
+    pub maker_base_fee: Option<Decimal>,
+    /// Legacy V1 taker base fee. Unused in V2 settlement.
+    #[serde(rename = "tbf", default)]
+    pub taker_base_fee: Option<Decimal>,
+    #[serde(rename = "rfqe", default)]
+    pub rfq_enabled: bool,
+}
+
+#[non_exhaustive]
+#[derive(Clone, Debug, Deserialize, Builder, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct BuilderFeeRateResponse {
+    #[serde(alias = "builder_maker_fee_rate_bps")]
+    pub builder_maker_fee_rate_bps: u32,
+    #[serde(alias = "builder_taker_fee_rate_bps")]
+    pub builder_taker_fee_rate_bps: u32,
 }
 
 /// Response from creating an RFQ request.
